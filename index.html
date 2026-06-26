@@ -1,249 +1,28 @@
-import os
-import shutil
-from uuid import uuid4
-from datetime import datetime
-from typing import List, Dict, Any
-
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-import pandas as pd
-import docx
-import pdfplumber
-from rapidfuzz import process, fuzz
-
-app = FastAPI(title="MedArchive QA System", version="1.0 MVP")
-
-# Имитация Базы Данных в памяти (In-Memory) для хакатона
-# На реальном проекте здесь будут таблицы PostgreSQL через SQLAlchemy
-DB_PARTNERS: Dict[str, Any] = {}
-DB_PRICE_DOCUMENTS: Dict[str, Any] = {}
-DB_PRICE_ITEMS: List[Dict[str, Any]] = []
-
-# Наш целевой справочник услуг (загружается при старте)
-# Заполним фейковыми данными для примера, структуры как в ТЗ
-DB_SERVICES = [
-    {"service_id": "s1", "service_name": "Общий анализ крови", "synonyms": ["ОАК", "анализ крови общий"], "category": "лаборатория"},
-    {"service_id": "s2", "service_name": "УЗИ брюшной полости", "synonyms": ["Ультразвуковое исследование ОБП"], "category": "диагностика"},
-    {"service_id": "s3", "service_name": "Консультация терапевта", "synonyms": ["Прием врача-терапевта"], "category": "консультация"}
-]
-
-
-# --- ТЕХНИЧЕСКИЕ И БИЗНЕС-ВАЛИДАТОРЫ (Пункт 4.4 ТЗ) ---
-def validate_and_clean_item(raw_name: str, raw_code: str, raw_price: str, doc_id: str, partner_id: str) -> Dict[str, Any]:
-    """Проверяет строку прайса на аномалии и ошибки."""
-    log_messages = []
-    status = "done"
-    
-    # Валидация: Название не должно быть пустым
-    if not raw_name or str(raw_name).strip() == "":
-        return None  # Пропуск строки
-        
-    # Валидация и очистка цены
-    try:
-        # Убираем пробелы, знаки валют "тг", "KZT"
-        clean_price = str(raw_price).replace(" ", "").replace("тг", "").replace("KZT", "").strip()
-        price_val = float(clean_price)
-        if price_val <= 0:
-            status = "needs_review"
-            log_messages.append("Цена <= 0")
-    except Exception:
-        price_val = 0.0
-        status = "needs_review"
-        log_messages.append(f"Не удалось распознать цену: {raw_price}")
-
-    # -- НОРМАЛИЗАЦИЯ И NLP-ПОИСК (Пункт 4.3 ТЗ — Вес 25%) ---
-    matched_service_id = None
-    best_score = 0
-    
-    # Пробегаемся по справочнику услуг
-    for s in DB_SERVICES:
-        # Проверяем точное совпадение или совпадение по синонимам
-        all_names = [s["service_name"]] + s["synonyms"]
-        # Используем нечеткий поиск RapidFuzz
-        extract_result = process.extractOne(raw_name, all_names, scorer=fuzz.WRatio)
-        
-        if extract_result:
-            score = extract_result[1]
-            if score > best_score:
-                best_score = score
-                if score >= 85.0:  # Порог уверенности из ТЗ
-                    matched_service_id = s["service_id"]
-
-    if not matched_service_id:
-        status = "needs_review"
-        log_messages.append("Услуга не сопоставлена автоматически (низкий score)")
-
-    return {
-        "item_id": str(uuid4()),
-        "doc_id": doc_id,
-        "partner_id": partner_id,
-        "service_name_raw": raw_name,
-        "service_code_source": raw_code,
-        "service_id": matched_service_id,
-        "price_resident_kzt": price_val,
-        "price_nonresident_kzt": price_val, # Для MVP дублируем, если нет отдельной колонки
-        "is_verified": True if status == "done" else False,
-        "verification_note": "; ".join(log_messages),
-        "status": status
-    }
-
-
-# --- ДВИЖКИ ИЗВЛЕЧЕНИЯ ДАННЫХ (Пункт 4.2 ТЗ) ---
-def extract_from_xlsx(file_path: str) -> List[tuple]:
-    """Парсинг Excel таблиц через Pandas."""
-    extracted = []
-    # Читаем первый лист. В реале надо обходить все листы циклами.
-    df = pd.read_excel(file_path, header=None)
-    
-    for _, row in df.iterrows():
-        row_list = [str(cell).strip() if pd.notna(cell) else "" for cell in row]
-        if not any(row_list):
-            continue
-        # Пропускаем шапки
-        if "наименование" in "".join(row_list).lower() or "цена" in "".join(row_list).lower():
-            continue
-        if len(row_list) >= 2:
-            # Считаем, что первая колонка — название/код, последняя — цена
-            extracted.append((row_list[0], row_list[0], row_list[-1]))
-    return extracted
-
-
-def extract_from_docx(file_path: str) -> List[tuple]:
-    """Парсинг таблиц из документов Word."""
-    extracted = []
-    doc = docx.Document(file_path)
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if not any(cells) or "наименование" in "".join(cells).lower():
-                continue
-            if len(cells) >= 2:
-                extracted.append((cells[0], cells[0], cells[-1]))
-    return extracted
-
-
-def extract_from_pdf(file_path: str) -> List[tuple]:
-    """Твой доработанный алгоритм на pdfplumber."""
-    extracted = []
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            if not tables:
-                continue
-            for table in tables:
-                for row in table:
-                    row = [str(c).strip() if c is not None else "" for c in row]
-                    if not any(row) or "наименование" in "".join(row).lower():
-                        continue
-                    if len(row) >= 3:
-                        extracted.append((row[0], row[1], row[2]))
-    return extracted
-
-
-# --- ФОНОВЫЙ ВОРКЕР ОБРАБОТКИ ФАЙЛОВ (Пункт 4.1 ТЗ) ---
-def pipeline_process_file(file_path: str, doc_id: str, partner_id: str):
-    DB_PRICE_DOCUMENTS[doc_id]["parse_status"] = "processing"
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    try:
-        # Определяем формат и запускаем нужный парсер
-        if ext in [".xlsx", ".xls"]:
-            raw_rows = extract_from_xlsx(file_path)
-        elif ext == ".docx":
-            raw_rows = extract_from_docx(file_path)
-        elif ext == ".pdf":
-            raw_rows = extract_from_pdf(file_path)
-        else:
-            raise ValueError(f"Неподдерживаемый формат файла: {ext}")
-            
-        if not raw_rows:
-            raise ValueError("Документ не содержит распознаваемых табличных данных")
-
-        # Валидируем и сохраняем каждую строчку
-        success_count = 0
-        for code, name, price in raw_rows:
-            item = validate_and_clean_item(name, code, price, doc_id, partner_id)
-            if item:
-                DB_PRICE_ITEMS.append(item)
-                if item["status"] == "done":
-                    success_count += 1
-                    
-        DB_PRICE_DOCUMENTS[doc_id]["parse_status"] = "done"
-        DB_PRICE_DOCUMENTS[doc_id]["parse_log"] = f"Успешно обработано строк: {success_count} из {len(raw_rows)}"
-        
-    except Exception as e:
-        DB_PRICE_DOCUMENTS[doc_id]["parse_status"] = "error"
-        DB_PRICE_DOCUMENTS[doc_id]["parse_log"] = str(e)
-
-
-# --- API ENDPOINTS (Пункт 4.5 ТЗ) ---
-
-@app.post("/upload-price")
-async def upload_price(
-    partner_name: str, 
-    city: str, 
-    background_tasks: BackgroundTasks, 
-    file: UploadFile = File(...)
-):
-    """Прием файла, регистрация партнера и отправка задачи в фон."""
-    # 1. Создаем или находим партнера
-    partner_id = str(uuid4())
-    DB_PARTNERS[partner_id] = {
-        "partner_id": partner_id, "name": partner_name, "city": city, "is_active": True
-    }
-    
-    # 2. Регистрируем документ в системе
-    doc_id = str(uuid4())
-    file_dir = "./storage"
-    os.makedirs(file_dir, exist_ok=True)
-    saved_path = os.path.join(file_dir, f"{doc_id}_{file.filename}")
-    
-    # Сохраняем оригинальный файл на диск
-    with open(saved_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    DB_PRICE_DOCUMENTS[doc_id] = {
-        "doc_id": doc_id,
-        "partner_id": partner_id,
-        "file_name": file.filename,
-        "parse_status": "pending",
-        "parse_log": ""
-    }
-    
-    # 3. Запускаем асинхронную обработку в фоне (замена Celery на старте)
-    background_tasks.add_task(pipeline_process_file, saved_path, doc_id, partner_id)
-    
-    return {"message": "Файл принят в обработку", "doc_id": doc_id, "partner_id": partner_id}
-
-
-@app.get("/services")
-def get_services():
-    """Список всех нормализованных услуг справочника."""
-    return DB_SERVICES
-
-
-@app.get("/search")
-def search_prices(q: str):
-    """Полнотекстовый / нечеткий поиск по прайс-листам."""
-    results = []
-    for item in DB_PRICE_ITEMS:
-        if q.lower() in item["service_name_raw"].lower() and item["is_verified"]:
-            partner = DB_PARTNERS.get(item["partner_id"], {})
-            results.append({
-                "clinic": partner.get("name"),
-                "city": partner.get("city"),
-                "service": item["service_name_raw"],
-                "price": item["price_resident_kzt"]
-            })
-    return results
-
-
-@app.get("/unmatched")
-def get_unmatched():
-    """Очередь для ручной проверки оператором."""
-    return [item for item in DB_PRICE_ITEMS if item["status"] == "needs_review"]
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Мой проект с хакатона</title>
+    <style>
+        body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
+        h1 { color: #2c3e50; }
+        .card { background: #f4f4f4; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        a { color: #3498db; }
+    </style>
+</head>
+<body>
+    <h1>🏥 Парсер прайса клиники</h1>
+    <p>Привет! Это мой проект с хакатона 26.06.2026</p>
+    <div class="card">
+        <h2>Что делает проект</h2>
+        <p>Читает PDF файлы с прайсами клиник и переносит всё в Excel таблицу автоматически</p>
+    </div>
+    <div class="card">
+        <h2>Код проекта</h2>
+        <a href="https://github.com/adilzhumashev77-commits/adil.github.med">Смотреть на GitHub</a>
+    </div>
+    <div class="card">
+        <h2>Автор</h2>
+        <p>Адил, 9 класс</p>
+    </div>
+</body>
+</html>
